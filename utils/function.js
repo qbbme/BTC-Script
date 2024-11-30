@@ -177,31 +177,25 @@ function logger() {
  */
 function isValidBitcoinAddress(address, network) {
     try {
-        // 解析比特币地址
-        const decoded = bitcoin.address.fromBech32(address);
-
-        // 检查地址前缀和版本号
-        if (network === bitcoin.networks.bitcoin) {
-            if (decoded.prefix !== 'bc') return false;
-        } else if (network === bitcoin.networks.testnet) {
-            if (decoded.prefix !== 'tb') return false;
-        } else {
-            return false;
+        // 首先尝试 bech32 验证
+        try {
+            const decoded = bitcoin.address.fromBech32(address);
+            
+            // 检查网络前缀
+            if (network === bitcoin.networks.bitcoin) {
+                if (decoded.prefix !== 'bc') return false;
+            } else if (network === bitcoin.networks.testnet) {
+                if (decoded.prefix !== 'tb') return false;
+            }
+            
+            // 对 P2TR 和 P2WPKH 都有效
+            return true;
+        } catch (e) {
+            // 如果 bech32 验证失败，尝试验证传统地址
+            bitcoin.address.toOutputScript(address, network);
+            return true;
         }
-
-        // 检查数据部分的长度和类型
-        if (address.startsWith('bc1p')) {
-            // P2TR 地址的版本号为 1，数据长度为 32 字节
-            return decoded.version === 1 && decoded.data.length === 32;
-        } else if (address.startsWith('bc1q')) {
-            // P2WPKH 地址的版本号为 0，数据长度为 20 字节
-            // P2WSH 地址的版本号为 0，数据长度为 32 字节
-            return decoded.version === 0 && (decoded.data.length === 20 || decoded.data.length === 32);
-        }
-
-        return false;
     } catch (e) {
-        // 捕获解析错误，返回地址不合法
         return false;
     }
 }

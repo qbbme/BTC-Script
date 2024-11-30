@@ -16,6 +16,8 @@ const network = config.network;
 const request = new Request(config);
 
 const exchangeRate = 1e8;
+const DUST_AMOUNT = 546;
+const MIN_FEE_RATE = 1;
 
 // @apidoc: https://mempool.space/signet/docs/api/rest
 // @apidoc: https://mempool.fractalbitcoin.io/zh/docs/api/rest
@@ -65,64 +67,86 @@ function calculateWeight(inputCount, outputCount) {
 
 // 转账
 async function transfer(keyPair, toAddresses, toAmountSATSAll) {
-    const xOnlyPubkey = toXOnly(keyPair.publicKey);
-
-    // 发送方地址
-    const {address: fromAddress, output, witness} = bitcoin.payments.p2tr({internalPubkey: xOnlyPubkey, network});
+    let fromAddress, output;
+    
+    if (network === bitcoin.networks.testnet) {
+        // P2PKH address for testnet
+        const p2pkh = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network });
+        fromAddress = p2pkh.address;
+        output = p2pkh.output;
+    } else {
+        // Default P2TR address
+        const xOnlyPubkey = toXOnly(keyPair.publicKey);
+        const p2tr = bitcoin.payments.p2tr({ internalPubkey: xOnlyPubkey, network });
+        fromAddress = p2tr.address;
+        output = p2tr.output;
+    }
 
     // 动态查询 UTXO
     const utxoAll = await request.getUTXO(fromAddress);
+    console.log('UTXOs found:', utxoAll); // 调试日志
 
     // 如果没有 UTXO，则无法进行转账，返回错误信息
-    if (utxoAll.length === 0) {
+    if (!Array.isArray(utxoAll) || utxoAll.length === 0) {
         return 'No UTXO';
     }
 
-    // TODO: 确认UTXO是否可用（避免误烧和金额不够）
+    // 获取预估的 gas 费用
+    const gas = await request.getGas();
+    // 预估总交易大小（保守估计）
+    const estimatedTxSize = Math.ceil(calculateWeight(1, toAddresses.length + 1) / 4);
+    // 预估最小手续费
+    const estimateSATS = gas * estimatedTxSize;
+
+    // 处理 UTXO
     let availableUTXO = [];
     for (const utxo of utxoAll) {
-        if (utxo.value > 546 || utxo.satoshis > 546) {
+        // mempool.space API 的 UTXO 格式适配
+        const utxoValue = utxo.value || utxo.satoshis || 0;
+        if (utxoValue > DUST_AMOUNT) {
             availableUTXO.push({
                 txid: utxo.txid,
                 vout: utxo.vout,
-                value: utxo.value && utxo.value > 0 ? utxo.value : utxo.satoshis,
+                value: utxoValue,
             });
         }
     }
+
     if (availableUTXO.length === 0) {
+        console.log('No available UTXOs after filtering'); // 调试日志
         return 'No UTXO';
     }
 
-    // 预估 交易大小=10+输入数量×148+输出数量×34
-    let estimateSATS = 10 + (toAddresses.length + 1) * 43 + availableUTXO.length * 148;
-
-    const psbt = new bitcoin.Psbt({network});
+    const psbt = new bitcoin.Psbt({ network });
     let inputValue = 0;
-
     let utxoStr = '';
     let i = 1;
+
     for (const utxo of availableUTXO) {
-        if (inputValue < toAmountSATSAll + estimateSATS) {
-            const utxoHash = utxo.txid;
-            const input = {
-                // UTXO 的输出索引
-                index: utxo.vout,
-                // UTXO 的交易哈希
-                hash: utxoHash,
-                witnessUtxo: {
-                    // UTXO 的输出脚本
-                    script: output,
-                    // UTXO 的金额
-                    value: utxo.value,
-                },
-                tapInternalKey: xOnlyPubkey, // 添加 Taproot 内部密钥
-            };
-            psbt.addInput(input);
+        const input = {
+            hash: utxo.txid,
+            index: utxo.vout,
+            witnessUtxo: {
+                script: output,
+                value: utxo.value,
+            }
+        };
 
-            utxoStr += `    utxo${i}-txid: ${utxoHash}\n`
-            i++;
+        // 根据地址类型添加不同的签名参数
+        if (network === bitcoin.networks.testnet) {
+            // P2PKH 需要添加 redeemScript
+            input.nonWitnessUtxo = await request.getTxHex(utxo.txid);
+        } else {
+            input.tapInternalKey = toXOnly(keyPair.publicKey);
+        }
 
-            inputValue += utxo.value;
+        psbt.addInput(input);
+        utxoStr += `    utxo${i}-txid: ${utxo.txid}\n`;
+        i++;
+        inputValue += utxo.value;
+
+        if (inputValue >= toAmountSATSAll + estimateSATS) {
+            break;
         }
     }
 
@@ -137,7 +161,6 @@ async function transfer(keyPair, toAddresses, toAmountSATSAll) {
         outputValue += parseInt(toAddress.Amount * exchangeRate);
     }
 
-    const gas = await request.getGas();
     // 设置 gas
     const fee = gas * Math.ceil(calculateWeight(psbt.data.inputs.length, toAddresses.length + 1) / 4);
     console.log(Math.ceil(calculateWeight(psbt.data.inputs.length, toAddresses.length + 1) / 4));
@@ -158,21 +181,23 @@ async function transfer(keyPair, toAddresses, toAmountSATSAll) {
         });
     }
 
-    const tweakedChildNode = keyPair.tweak(
-        bitcoin.crypto.taggedHash('TapTweak', xOnlyPubkey),
-    );
-
+    // Get xOnlyPubkey from keyPair
+    const xOnlyPubkey = toXOnly(keyPair.publicKey);
+    
     // 签名所有输入
     psbt.data.inputs.forEach((input, index) => {
-        psbt.signInput(index, tweakedChildNode);
+        if (network === bitcoin.networks.testnet) {
+            // For P2PKH (testnet)
+            psbt.signInput(index, keyPair);
+        } else {
+            // For P2TR (mainnet)
+            const tweakedChildNode = keyPair.tweak(
+                bitcoin.crypto.taggedHash('TapTweak', xOnlyPubkey),
+            );
+            psbt.signInput(index, tweakedChildNode);
+        }
     });
 
-    // // 定义验证函数，用于校验签名是否有效
-    // const validator = (pubkey, msghash, signature) => {
-    //     return ECPair.fromPublicKey(pubkey).verify(msghash, signature);
-    // };
-    // // 验证输入签名
-    // psbt.validateSignaturesOfInput(0, validator);
     // 终结所有输入，表示签名完成
     psbt.finalizeAllInputs();
 
@@ -215,8 +240,16 @@ async function main() {
     const keyPair = getKeyPairByPrivateKey(fromAddressWIF);
 
     const xOnlyPubkey = toXOnly(keyPair.publicKey);
-    // 发送方地址
-    const {address: fromAddress, output} = bitcoin.payments.p2tr({internalPubkey: xOnlyPubkey, network});
+    // 发送方址
+    let fromAddress;
+    if (network === bitcoin.networks.testnet) {
+        // Handle P2PKH address for testnet
+        fromAddress = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network }).address;
+    } else {
+        // Default to P2TR address
+        fromAddress = bitcoin.payments.p2tr({ internalPubkey: xOnlyPubkey, network }).address;
+    }
+    
 
     let balance = await request.getBalance(fromAddress);
     let balanceSATS = 0;

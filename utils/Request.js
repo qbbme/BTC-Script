@@ -47,27 +47,31 @@ class Request {
 
     // 查询 UTXO
     async getUTXO(address) {
-        if (this.networkType === "fractal") {
-            const url = `https://wallet-api-fractal.unisat.io/v5/address/btc-utxo?address=${address}`;
-            const res = await this.request({url: url});
-            if (res.status === 200 && res.data && res.data.code === 0) {
-                return res.data.data;
+        try {
+            if (this.networkType === "fractal") {
+                const url = `https://wallet-api-fractal.unisat.io/v5/address/btc-utxo?address=${address}`;
+                const res = await this.request({url: url});
+                if (res.status === 200 && res.data && res.data.code === 0) {
+                    return res.data.data;
+                }
+            } else if (this.networkType === "fractal_test") {
+                const url = `https://wallet-api-fractal-testnet.unisat.io/v5/address/btc-utxo?address=${address}`;
+                const res = await this.request({url: url});
+                if (res.status === 200 && res.data && res.data.code === 0) {
+                    return res.data.data;
+                }
+            } else {
+                // mempool.space API
+                const url = `${this.URI}/address/${address}/utxo`;
+                const res = await this.request({url: url});
+                // mempool.space API 直接返回数组，不需要检查 code
+                if (res.status === 200) {
+                    return res.data;
+                }
             }
-        } else if (this.networkType === "fractal_test") {
-            const url = `https://wallet-api-fractal-testnet.unisat.io/v5/address/btc-utxo?address=${address}`;
-            const res = await this.request({url: url});
-            if (res.status === 200 && res.data && res.data.code === 0) {
-                return res.data.data;
-            }
-        } else {
-            // 接口错误，换接口
-            const url = `${this.URI}/address/${address}/utxo`;
-            const res = await this.request({url: url});
-            if (res.status === 200 && res.data && res.data.code === 0) {
-                return res.data.data;
-            }
+        } catch (error) {
+            console.error('Error fetching UTXOs:', error);
         }
-
         return [];
     }
 
@@ -192,6 +196,19 @@ class Request {
             logger().error(`${url} ${error.toString()}`);
             return error.response;
         }
+    }
+
+    async getTxHex(txid) {
+        try {
+            const url = `${this.URI}/tx/${txid}/hex`;
+            const res = await this.request({url: url});
+            if (res.status === 200) {
+                return Buffer.from(res.data, 'hex');
+            }
+        } catch (error) {
+            console.error('Error fetching tx hex:', error);
+        }
+        return null;
     }
 
 }
